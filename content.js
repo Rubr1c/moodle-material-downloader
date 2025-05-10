@@ -1,5 +1,7 @@
 console.log('Moodle Downloader content script loaded.');
 
+let isCancelled = false; // Global cancellation flag for the current process
+
 function isMoodleCoursePage() {
   const currentUrl = window.location.href;
   return currentUrl.includes('moodle') && currentUrl.includes('course');
@@ -26,11 +28,17 @@ function findSesskey(doc) {
   return null;
 }
 
-async function processAndDownloadFiles() {
+// Helper to send progress updates to background script
+function sendProgress(statusText) {
   chrome.runtime.sendMessage({
-    action: 'downloadStatus',
-    status: 'processing',
+    action: 'progressUpdate',
+    statusText: statusText,
   });
+}
+
+async function processAndDownloadFiles() {
+  isCancelled = false;
+  sendProgress('Initializing download...');
   console.log('processAndDownloadFiles: Starting link discovery.');
 
   const finalDownloadableItems = [];
@@ -44,43 +52,47 @@ async function processAndDownloadFiles() {
         'a.aalink.stretched-link, a.grid-section-inner.d-flex.flex-column.h-100, a.aalink[href*="/folder/view.php"], a.aalink[href*="/resource/view.php"]'
       )
       .forEach((a) => {
+        if (isCancelled) return;
         if (a.href) {
           const absUrl = new URL(a.href, document.baseURI).href;
           if (!processedOrScheduledUrls.has(absUrl)) {
             urlsToVisit.push(absUrl);
             processedOrScheduledUrls.add(absUrl);
-            console.log(`Initial scan: Added to visit queue - ${absUrl}`);
           }
         }
       });
+    sendProgress(`Found ${urlsToVisit.length} initial links to scan...`);
   } else {
     console.warn(
       'Not on a Moodle course page, or initial link scan failed to identify it as such.'
     );
-    chrome.runtime.sendMessage({
-      action: 'downloadStatus',
-      status: 'failed',
-      error: 'Not a Moodle course page',
-    });
     return { status: 'failed', error: 'Not a Moodle course page' };
+  }
+
+  if (isCancelled) {
+    console.log('Cancelled before link discovery.');
+    return { status: 'cancelled' };
   }
 
   if (urlsToVisit.length === 0) {
     console.warn('No initial links found on the course page to process.');
-    chrome.runtime.sendMessage({
-      action: 'downloadStatus',
-      status: 'failed',
-      error: 'No initial links found',
-    });
     return { status: 'failed', error: 'No initial links found' };
   }
 
   while (urlsToVisit.length > 0) {
+    if (isCancelled) {
+      console.log('Cancelled during link discovery loop.');
+      break;
+    }
     const currentUrl = urlsToVisit.shift();
+    const shortUrlForStatus =
+      currentUrl.substring(currentUrl.lastIndexOf('/') + 1) || currentUrl;
+    sendProgress(`Scanning: ${shortUrlForStatus}...`);
     console.log(`Processing from queue: ${currentUrl}`);
 
     try {
       const pageResponse = await fetch(currentUrl);
+      if (isCancelled) break;
       if (!pageResponse.ok) {
         console.warn(
           `Failed to fetch ${currentUrl}, status: ${pageResponse.status}`
@@ -114,6 +126,8 @@ async function processAndDownloadFiles() {
         if (downloadFolderButton)
           downloadForm = downloadFolderButton.closest('form');
 
+        if (isCancelled) break;
+
         if (downloadForm) {
           const actionAttr =
             downloadForm.getAttribute('action') ||
@@ -139,7 +153,7 @@ async function processAndDownloadFiles() {
                 url: folderZipUrl.href,
                 type: 'folder_zip',
               });
-              processedOrScheduledUrls.add(folderZipUrl.href); // Mark this specific download URL as processed
+              processedOrScheduledUrls.add(folderZipUrl.href);
             }
             folderZipUrlConstructed = true;
           } else {
@@ -148,6 +162,7 @@ async function processAndDownloadFiles() {
             );
           }
         }
+        if (isCancelled) break;
         if (!folderZipUrlConstructed) {
           console.warn(
             `Could not get folder ZIP URL for ${currentUrl}. Scanning for individual files inside.`
@@ -157,14 +172,12 @@ async function processAndDownloadFiles() {
               'a.aalink[href*="resource/view.php"], a[href*="pluginfile.php"]'
             )
             .forEach((a) => {
+              if (isCancelled) return;
               if (a.href) {
                 const absLink = new URL(a.href, pageBaseUrl).href;
                 if (!processedOrScheduledUrls.has(absLink)) {
                   urlsToVisit.push(absLink);
                   processedOrScheduledUrls.add(absLink);
-                  console.log(
-                    `Folder Fallback: Added to visit queue - ${absLink}`
-                  );
                 }
               }
             });
@@ -186,17 +199,18 @@ async function processAndDownloadFiles() {
             'a.aalink[href*="/folder/view.php"], a.aalink[href*="/resource/view.php"]'
           )
           .forEach((a) => {
+            if (isCancelled) return;
             if (a.href) {
               const absLink = new URL(a.href, pageBaseUrl).href;
               if (!processedOrScheduledUrls.has(absLink)) {
                 urlsToVisit.push(absLink);
                 processedOrScheduledUrls.add(absLink);
-                console.log(`General Scan: Added to visit queue - ${absLink}`);
               }
             }
           });
       }
     } catch (err) {
+      if (isCancelled) break;
       console.warn(
         `Error processing URL ${currentUrl} in discovery loop:`,
         err
@@ -204,18 +218,20 @@ async function processAndDownloadFiles() {
     }
   }
 
+  if (isCancelled) {
+    console.log('Cancelled before download phase.');
+    return { status: 'cancelled' };
+  }
   console.log(
     'Link discovery phase complete. Final items to download:',
     finalDownloadableItems
   );
+  sendProgress(
+    `Found ${finalDownloadableItems.length} items. Starting downloads...`
+  );
 
-  if (finalDownloadableItems.length === 0) {
+  if (finalDownloadableItems.length === 0 && !isCancelled) {
     console.warn('No downloadable items found after full scan.');
-    chrome.runtime.sendMessage({
-      action: 'downloadStatus',
-      status: 'failed',
-      error: 'No items found after scan',
-    });
     return { status: 'failed', error: 'No items found after scan' };
   }
 
@@ -223,9 +239,17 @@ async function processAndDownloadFiles() {
   let filesAddedToZip = 0;
 
   for (const item of finalDownloadableItems) {
+    if (isCancelled) {
+      console.log('Cancelled during download/zipping phase.');
+      break;
+    }
     let actualFileUrl = item.url;
     let responseForFile;
     let originalPageUrlForFilenameFallback = item.url;
+    const shortFilenameForStatus =
+      actualFileUrl.substring(actualFileUrl.lastIndexOf('/') + 1) ||
+      actualFileUrl;
+    sendProgress(`Downloading: ${shortFilenameForStatus}...`);
 
     try {
       console.log(`Downloading item: ${item.url} (type: ${item.type})`);
@@ -238,6 +262,7 @@ async function processAndDownloadFiles() {
           `Fetching resource page: ${actualFileUrl} to find actual file link or handle redirect.`
         );
         const resourcePageResponse = await fetch(actualFileUrl);
+        if (isCancelled) break;
         if (!resourcePageResponse.ok) {
           console.warn(
             `Failed to fetch resource page ${actualFileUrl}, status: ${resourcePageResponse.status}`
@@ -287,10 +312,14 @@ async function processAndDownloadFiles() {
         }
       }
 
+      if (isCancelled) break;
+
       if (!responseForFile) {
         console.log(`Fetching actual file content from: ${actualFileUrl}`);
         responseForFile = await fetch(actualFileUrl); // This is for item.type 'folder_zip' or resolved 'file'
       }
+
+      if (isCancelled) break;
 
       if (!responseForFile.ok) {
         console.warn(
@@ -360,8 +389,7 @@ async function processAndDownloadFiles() {
             else if (actualFileUrl.toLowerCase().endsWith('.ppt')) ext = 'ppt';
             else if (actualFileUrl.toLowerCase().endsWith('.docx'))
               ext = 'docx';
-            else if (item.type === 'folder_zip')
-              ext = 'zip';
+            else if (item.type === 'folder_zip') ext = 'zip';
             else ext = '';
           }
           if (ext && ext !== 'octet-stream') filename += `.${ext}`;
@@ -372,12 +400,14 @@ async function processAndDownloadFiles() {
         .replace(/[^a-zA-Z0-9.\-_\s]/g, '_')
         .replace(/\s+/g, '_');
 
+      sendProgress(`Zipping: ${filename}...`);
       zip.file(filename, blob);
       filesAddedToZip++;
       console.log(
         `Added ${filename} (from ${actualFileUrl}, type: ${item.type}) to main course zip.`
       );
     } catch (err) {
+      if (isCancelled) break;
       console.warn(
         `Failed to process or add item ${item.url} (actual URL: ${actualFileUrl}) to zip:`,
         err
@@ -385,18 +415,23 @@ async function processAndDownloadFiles() {
     }
   }
 
+  if (isCancelled) {
+    console.log('Process was cancelled. No ZIP file will be generated.');
+    return { status: 'cancelled' };
+  }
+
   if (filesAddedToZip === 0) {
     console.warn('No files were successfully added to the main course zip.');
-    chrome.runtime.sendMessage({
-      action: 'downloadStatus',
-      status: 'failed',
-      error: 'No files zipped',
-    });
     return { status: 'failed', error: 'No files zipped' };
   }
 
   try {
+    sendProgress('Generating ZIP file...');
     const content = await zip.generateAsync({ type: 'blob' });
+    if (isCancelled) {
+      console.log('Cancelled before ZIP download.');
+      return { status: 'cancelled' };
+    }
     const link = document.createElement('a');
     link.href = URL.createObjectURL(content);
     let courseName = 'course_materials';
@@ -414,37 +449,75 @@ async function processAndDownloadFiles() {
     link.remove();
     URL.revokeObjectURL(link.href);
     console.log('Main course zip file download triggered.');
-    chrome.runtime.sendMessage({
-      action: 'downloadStatus',
-      status: 'complete',
-    });
     return { status: 'success' };
   } catch (error) {
     console.error('Error generating or downloading main course zip:', error);
-    chrome.runtime.sendMessage({
-      action: 'downloadStatus',
-      status: 'failed',
-      error: 'Zip generation failed',
-    });
     return { status: 'failed', error: 'Zip generation failed' };
   }
 }
 
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
-  if (request.action === 'startDownload') {
-    console.log('Received startDownload message from popup.');
+  if (sender.id !== chrome.runtime.id && !sender.tab) {
+    console.log(
+      'Content script received message:',
+      request,
+      'from sender:',
+      sender
+    );
+  }
+
+  if (request.action === 'startDownload' && request.from === 'background') {
+    console.log(
+      'Content Script: Received startDownload command from background.'
+    );
+    if (sendResponse) {
+      sendResponse({
+        status: 'success_starting',
+        message: 'Content script processing started.',
+      });
+    }
+
     processAndDownloadFiles()
-      .then((response) => sendResponse(response))
+      .then((response) => {
+        console.log(
+          'Content Script: processAndDownloadFiles finished, sending downloadStatus to background',
+          response
+        );
+        chrome.runtime.sendMessage({ action: 'downloadStatus', ...response });
+      })
       .catch((error) => {
-        console.error('Error in processAndDownloadFiles promise chain:', error);
-        sendResponse({
+        console.error(
+          'Content Script: Error in processAndDownloadFiles:',
+          error
+        );
+        const errResponse = {
           status: 'failed',
-          error: error.message || 'Unknown error during download processing',
+          error: error.message || 'Unknown error',
+        };
+        chrome.runtime.sendMessage({
+          action: 'downloadStatus',
+          ...errResponse,
         });
       });
     return true;
   } else if (request.action === 'checkMoodlePage') {
-    sendResponse({ isMoodleCoursePage: isMoodleCoursePage() });
+    if (sendResponse)
+      sendResponse({ isMoodleCoursePage: isMoodleCoursePage() });
+    return false;
+  } else if (
+    request.action === 'cancelDownload' &&
+    request.from === 'background'
+  ) {
+    console.log(
+      'Content Script: Received cancelDownload command from background.'
+    );
+    isCancelled = true;
+    if (sendResponse)
+      sendResponse({
+        status: 'cancelled',
+        message: 'Cancellation acknowledged by content script.',
+      });
     return false;
   }
+  return false;
 });
